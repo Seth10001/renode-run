@@ -2,25 +2,62 @@
 
 import os
 import sys
+import venv
 from pathlib import Path
 
 dashboard_link = "https://zephyr-dashboard.renode.io"
-renode_config = Path.home() / ".config" / "renode"
-renode_target_dir = renode_config / "renode-run.download"
-renode_run_config = renode_config / "renode-run.path"
+default_renode_artifacts_dir = Path.home() / ".config" / "renode"
+
+renode_target_dirname = "renode-run.download"
+renode_run_config_filename = "renode-run.path"
+renode_test_venv_dirname = "renode-run.venv"
+
+
+class EnvBuilderWithRequirements(venv.EnvBuilder):
+    def __init__(self, *args, **kwargs):
+        self.requirements_path = kwargs.pop('requirements_path', None)
+        kwargs['with_pip'] = True
+        super().__init__(*args, **kwargs)
+
+    def post_setup(self, context):
+        if self.requirements_path is None:
+            return
+
+        import subprocess
+
+        args = [context.env_exe, '-m', 'pip', 'install', '-r', self.requirements_path]
+        env = os.environ
+        env['VIRTUAL_ENV'] = context.env_dir
+
+        try:
+            subprocess.check_call(args, env=env)
+        except subprocess.CalledProcessError as err:
+            print(f'Could not install given requirements: {err}')
 
 
 def parse_args():
     import argparse
     parser = argparse.ArgumentParser()
+    parser.add_argument('-a', '--artifacts', dest='artifacts_path', default=str(default_renode_artifacts_dir), help='Path for renode-run artifacts (e.g. config, Renode installations)')
+
     subparsers = parser.add_subparsers(title="commands", dest="command")
+
     dl_subparser = subparsers.add_parser("download", help="Download Renode portable (Linux only!)")
-    dl_subparser.add_argument('-p', '--path', dest='path', default=str(renode_target_dir), help="Path for Renode download")
+    dl_subparser.add_argument('-p', '--path', dest='path', default=None, help="Path for Renode download")
+    dl_subparser.add_argument('-d', '--direct', dest='direct', action='store_true', help="Do not create additional directories with Renode version")
+
+    exec_subparser = subparsers.add_parser("exec", help="Execute Renode with arguments")
+    exec_subparser.add_argument('renode_args', default=[], nargs=argparse.REMAINDER)
+
+    test_subparser = subparsers.add_parser("test", help="Execute renode-test with arguments")
+    test_subparser.add_argument('--venv', dest='venv_path', help='Path for virtualenv used by renode-test')
+    test_subparser.add_argument('renode_args', default=[], nargs=argparse.REMAINDER)
 
     demo_subparser = subparsers.add_parser("demo", help="Run a demo from precompiled binaries")
     demo_subparser.add_argument('-b', '--binary', dest='binary', default="shell_module", help="Binary name, either local of remote")
     demo_subparser.add_argument('-g', '--generate-repl', dest='generate_repl', action='store_true', help="Whether to generate the repl from dts")
     demo_subparser.add_argument('platform', help="Platform name")
+
     args = parser.parse_args()
     return args
 
@@ -32,7 +69,7 @@ def report_progress(count, size, filesize):
     print(f"Downloaded {current:.2f}MB / {total:.2f}MB...", end='\r')
 
 
-def download_renode(path):
+def download_renode(target_dir_path, config_path, direct=False):
     if not sys.platform.startswith('linux'):
         raise Exception("Renode can only be automatically downloaded on Linux. On other OSes please visit https://builds.renode.io and install the latest package for your system.")
 
@@ -44,27 +81,45 @@ def download_renode(path):
     print()
     print("Download finished!")
 
-    target_dir = Path(path)
+    target_dir = Path(target_dir_path)
     os.makedirs(target_dir, exist_ok=True)
     try:
         with tarfile.open(renode_package) as tar:
-            renode_version = tar.members[0].name
-            final_path = target_dir / renode_version
-            if Path.exists(final_path):
-                print(f"Renode {renode_version} is already available in {target_dir}, keeping the previous version")
-                return
-            tar.extractall(target_dir)
+            if direct:
+                # When --direct argument is passed, we would like to
+                # extract contents of the archive directly to path given by user,
+                # and not into new directory. Therefore we iterate over all files (paths)
+                # in archive, and strip them from the first part, which is renode_<version>
+                # directory.
+                final_path = target_dir
+                renode_bin_path = final_path / 'renode'
+                if Path.exists(renode_bin_path):
+                    print(f"Renode is already present in {target_dir}")
+                    return
+                members = tar.getmembers()
+                for member in members:
+                    old_member_path = Path(member.path).parts[1:]
+                    member.path = Path(*old_member_path)
+                tar.extractall(target_dir, members=members)
+            else:
+                renode_version = tar.members[0].name
+                final_path = target_dir / renode_version
+                if Path.exists(final_path):
+                    print(f"Renode {renode_version} is already available in {target_dir}, keeping the previous version")
+                    return
+                tar.extractall(target_dir)
             print(f"Renode stored in {final_path}")
 
-        with open(renode_run_config, mode="w") as config:
+        with open(config_path, mode="w") as config:
             config.write(str(final_path))
     finally:
         os.remove(renode_package)
 
 
-def get_renode(try_to_download=True):
-    # First, we try ~/.config/renode, then we look in $PATH
+def get_renode(artifacts_dir, try_to_download=True):
+    # First, we try <artifacts_dir>, then we look in $PATH
     renode_path = None
+    renode_run_config = Path(artifacts_dir) / renode_run_config_filename
     if Path.exists(renode_run_config):
         with open(renode_run_config, mode="r") as config:
             renode_path = Path(config.read()) / "renode"
@@ -80,8 +135,10 @@ def get_renode(try_to_download=True):
     if renode_path is None:
         if try_to_download:
             print('Renode not found. Downloading...')
-            download_renode(renode_target_dir)
-            return get_renode(False)
+            renode_target_dir = Path(artifacts_dir) / renode_target_dirname
+            renode_run_config_path = Path(artifacts_dir) / renode_run_config_filename
+            download_renode(renode_target_dir, renode_run_config_path)
+            return get_renode(artifacts_dir, False)
         else:
             print("Renode not found, could not download. Please run `renode-run download` manually or visit https://builds.renode.io")
 
@@ -147,45 +204,97 @@ echo "Use 'start' to run the demo"'''
     return script
 
 
-def main():
+def download_command(args):
+    renode_run_config_path = Path(args.artifacts_path) / renode_run_config_filename
+    target_dir_path = args.path
+    if target_dir_path is None:
+        target_dir_path = Path(args.artifacts_path) / renode_target_dirname
+    download_renode(target_dir_path, renode_run_config_path, args.direct)
+
+
+def demo_command(args):
     import json
     import requests
+    import tempfile
 
     url = requests.get(f"{dashboard_link}/results-shell_module_all.json", "results.json")
     results = json.loads(url.text)
 
     boards = [r["board_name"] for r in results]
+    renode_path = get_renode(args.artifacts_path)
 
-    import tempfile
+    if renode_path is None:
+        sys.exit(1)
+    if args.platform not in boards:
+        print(f'Platform "{args.platform}" not in Zephyr platforms list on server.')
+        print(f'Available platforms:{chr(10)}{chr(10).join(boards)}')
+        print('Choose one of the platforms listed above and try again.')
+        sys.exit(1)
+
+    script = generate_script(args.binary, args.platform, args.generate_repl)
+
+    with tempfile.NamedTemporaryFile() as temp:
+        temp.write(script.encode("utf-8"))
+        temp.flush()
+        subprocess.run(f"{renode_path} {temp.name}".split())
+
+
+def exec_command(args):
+    renode = get_renode(args.artifacts_path)
+    if renode is None:
+        sys.exit(1)
+
     import subprocess
 
-    if len(sys.argv) == 1:
-        renode_path = get_renode()
-        if renode_path is None:
-            sys.exit(1)
-        subprocess.run(renode_path)
-        return
+    renode_args = list(arg for arg in getattr(args, 'renode_args', []) if arg != '--')
+    subprocess.run([renode] + renode_args)
 
-    args = parse_args()
-    if args.command == 'download':
-        download_renode(args.path)
 
+def test_command(args):
+    renode = get_renode(args.artifacts_path)
+    if renode is None:
+        sys.exit(1)
+
+    renode_dir = Path(renode).parent
+    renode_test = renode_dir / 'renode-test'
+    if not Path.exists(renode_test):
+        print(f'Found Renode binary in {renode_dir}, but renode-test is missing; corrupted pacakge?')
+        sys.exit(1)
+
+    import subprocess
+    import venv
+
+    if args.venv_path is not None:
+        venv_path = Path(args.venv_path)
     else:
-        renode_path = get_renode()
-        if renode_path is None:
-            sys.exit(1)
-        if args.platform not in boards:
-            print(f'Platform "{args.platform}" not in Zephyr platforms list on server.')
-            print(f'Available platforms:{chr(10)}{chr(10).join(boards)}')
-            print('Choose one of the platforms listed above and try again.')
-            sys.exit(1)
+        venv_path = Path(args.artifacts_path) / renode_test_venv_dirname
 
-        script = generate_script(args.binary, args.platform, args.generate_repl)
+    python_bin = venv_path / 'bin'
+    python_path = python_bin / 'python'
+    if not Path.exists(python_path):
+        print(f'Bootstraping new virtual env in {venv_path}')
+        requirements_path = renode_dir / 'tests' / 'requirements.txt'
+        env_builder = EnvBuilderWithRequirements(clear=True, requirements_path=requirements_path)
+        env_builder.create(venv_path)
+    else:
+        print(f'Found python in {python_bin}')
 
-        with tempfile.NamedTemporaryFile() as temp:
-            temp.write(script.encode("utf-8"))
-            temp.flush()
-            subprocess.run(f"{renode_path} {temp.name}".split())
+    env = os.environ
+    env['PATH'] = f'{python_bin}:' + (env['PATH'] or '')
+
+    renode_args = list(arg for arg in getattr(args, 'renode_args', []) if arg != '--')
+    subprocess.run([renode_test] + renode_args, env=env)
+
+
+def main():
+    args = parse_args()
+    ({
+        'download': download_command,
+        'demo': demo_command,
+        'exec': exec_command,
+        'test': test_command,
+        None: exec_command,
+    })[args.command](args)
 
 
 if __name__ == "__main__":
