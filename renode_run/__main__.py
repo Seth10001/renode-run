@@ -144,7 +144,8 @@ macro reset
 
 runMacro $reset
 echo "Use 'start' to run the demo"
-start'''
+emulation RunFor "0.5"
+quit'''
 
     return script
 
