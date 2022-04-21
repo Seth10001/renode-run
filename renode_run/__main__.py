@@ -185,7 +185,7 @@ def main():
         with tempfile.NamedTemporaryFile() as temp:
             temp.write(script.encode("utf-8"))
             temp.flush()
-            subprocess.run(f"{renode_path} {temp.name}".split())
+            subprocess.run(f"{renode_path} --console {temp.name}".split())
 
 
 if __name__ == "__main__":
