@@ -143,7 +143,9 @@ macro reset
 """
 
 runMacro $reset
-echo "Use 'start' to run the demo"'''
+echo "Use 'start' to run the demo"
+start'''
+
     return script
 
 
@@ -185,7 +187,7 @@ def main():
         with tempfile.NamedTemporaryFile() as temp:
             temp.write(script.encode("utf-8"))
             temp.flush()
-            subprocess.run(f"{renode_path} --console {temp.name}".split())
+            subprocess.run(f"{renode_path} --console --disable-xwt {temp.name}".split())
 
 
 if __name__ == "__main__":
