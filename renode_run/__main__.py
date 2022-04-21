@@ -144,6 +144,7 @@ macro reset
 
 runMacro $reset
 echo "Use 'start' to run the demo"
+machine EnableProfiler @/tmp/metrics.dump
 emulation RunFor "0.5"
 quit'''
 
